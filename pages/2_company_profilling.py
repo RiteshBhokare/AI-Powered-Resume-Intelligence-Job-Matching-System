@@ -1,72 +1,80 @@
-# ========== Import all required libraries ==========
-
+# ========== IMPORTS ==========
 import os
 import pdfplumber
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 import chromadb
+from openai import OpenAI
+from dotenv import load_dotenv
 
-# ========== Setup Streamlit and file paths ==========
+# ========== LOAD ENV ==========
+load_dotenv()  # 🔴 VERY IMPORTANT
 
+# ========== STREAMLIT CONFIG ==========
 st.set_page_config(
-    page_title="Company Profiling - Resume Matcher",
+    page_title="Resume Matcher - TRUE RAG",
     layout="centered"
 )
 
-# Folder where all resume PDFs are stored
+# ========== PATHS ==========
 RESUME_FOLDER = "/home/uadmin/Desktop/ResumeAnalyzerProject/Resume_Ananlysis_project_using_llm_langchain/resume_samples"
-
-# Folder where ChromaDB will store the embeddings
 CHROMA_PATH = "chroma_db"
 
-# ========== Load models and setup ChromaDB ==========
+SIMILARITY_THRESHOLD = 0.7  # cosine distance
 
+# ========== LOAD EMBEDDING MODEL ==========
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 embedder = load_embedder()
 
-# Initialize ChromaDB (persistent)
+# ========== OPENAI CLIENT ==========
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    st.error("❌ OPENAI_API_KEY not found. Please set it in .env file.")
+    st.stop()
+
+
+client = OpenAI(
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1"
+)
+
+
+# ========== CHROMA DB ==========
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
-# Explicit cosine similarity (IMPORTANT)
 collection = chroma_client.get_or_create_collection(
     name="resumes",
     metadata={"hnsw:space": "cosine"}
 )
 
-# ========== Function to Embed Resumes from PDF ==========
-
+# ========== EMBED & STORE RESUMES ==========
 def embed_and_store_resumes():
-    """
-    Reads all PDF resumes from folder, creates embeddings,
-    and stores them in ChromaDB with proper status messages.
-    """
     pdf_files = [f for f in os.listdir(RESUME_FOLDER) if f.lower().endswith(".pdf")]
 
     if not pdf_files:
-        st.warning("⚠️ No PDF files found in the resume folder.")
+        st.warning("⚠️ No PDF resumes found.")
         return
 
     existing_ids = set(collection.get()["ids"])
-    added_count = 0
-    skipped_count = 0
-    failed_files = []
+    added, skipped, failed = 0, 0, []
 
     for file in pdf_files:
         if file in existing_ids:
-            skipped_count += 1
+            skipped += 1
             continue
 
-        full_path = os.path.join(RESUME_FOLDER, file)
-
         try:
-            with pdfplumber.open(full_path) as pdf:
+            path = os.path.join(RESUME_FOLDER, file)
+
+            with pdfplumber.open(path) as pdf:
                 text = " ".join(page.extract_text() or "" for page in pdf.pages)
 
             if not text.strip():
-                failed_files.append(file)
+                failed.append(file)
                 continue
 
             embedding = embedder.encode(text).tolist()
@@ -76,104 +84,119 @@ def embed_and_store_resumes():
                 embeddings=[embedding],
                 ids=[file]
             )
+            added += 1
 
-            added_count += 1
+        except Exception as e:
+            failed.append(file)
 
-        except Exception:
-            failed_files.append(file)
+    if added:
+        st.success(f"✅ {added} resumes embedded successfully.")
+    if skipped:
+        st.info(f"ℹ️ {skipped} resumes already exist.")
+    if failed:
+        st.error(f"❌ Failed resumes: {failed}")
 
-    # -------- FINAL STATUS MESSAGE --------
-
-    total = len(pdf_files)
-
-    if added_count == total:
-        st.success("✅ All resumes were embedded successfully!")
-    elif added_count > 0 and skipped_count > 0:
-        st.success(f"✅ {added_count} resumes embedded successfully.")
-        st.info(f"ℹ️ {skipped_count} resumes were already embedded.")
-    elif skipped_count == total:
-        st.info("ℹ️ All resumes were already embedded. No new embeddings needed.")
-    else:
-        st.warning("⚠️ Some resumes could not be processed.")
-
-    if failed_files:
-        st.error(f"❌ Failed to process {len(failed_files)} resumes:")
-        for f in failed_files:
-            st.write(f"• {f}")
-
-
-# ========== Function to Search Top Matching Resumes ==========
-
-def search_top_k_resumes(jd_text, top_k=5):
-    """
-    Takes a job description and returns top_k matching resumes.
-    """
+# ========== SEARCH ==========
+def search_top_k_resumes(jd_text, top_k=3):
     jd_vector = embedder.encode(jd_text).tolist()
 
-    results = collection.query(
+    return collection.query(
         query_embeddings=[jd_vector],
-        n_results=top_k
+        n_results=top_k,
+        include=["documents", "distances"]
     )
 
-    return results
+# ========== RAG PROMPT ==========
+def build_rag_prompt(jd, resume_ids, resume_texts):
+    context_blocks = []
 
-# ========== Streamlit UI Starts ==========
+    for i, (rid, text) in enumerate(zip(resume_ids, resume_texts), start=1):
+        context_blocks.append(
+            f"Candidate {i} (Resume ID: {rid}):\n{text}"
+        )
 
-st.title("Company Profiling - Resume Matcher (RAG + AI)")
+    combined_context = "\n\n---\n\n".join(context_blocks)
+
+    return f"""
+You are an expert HR assistant.
+
+Use ONLY the resume context below.
+If information is missing, say "Information not available".
+
+Resume Context:
+{combined_context}
+
+Job Description:
+{jd}
+
+Question:
+For EACH candidate:
+1. Explain suitability for the job
+2. Mention key matching skills
+3. Mention major gaps (if any)
+
+Respond in a clear, structured format.
+"""
+
+
+# ========== LLM GENERATION ==========
+def generate_answer(prompt):
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {"role": "system", "content": "You are a professional recruiter."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2
+    )
+    return response.choices[0].message.content
+
+# ========== STREAMLIT UI ==========
+st.title("📄 Resume Matcher – TRUE RAG System")
+
 st.markdown(
-    "Upload resumes into the database and search for the best matches based on the job description."
+    "This system retrieves relevant resumes from a vector database and generates an explanation using an LLM (RAG)."
 )
 
-# --- STEP 1: Embed Resumes ---
-with st.expander("Step 1: Embed Resumes from Folder"):
-    st.write(f"📂 Resume folder path:")
+# ---- STEP 1: EMBED RESUMES ----
+with st.expander("Step 1: Embed Resumes"):
     st.code(RESUME_FOLDER)
-    st.warning("Make sure the folder contains only `.pdf` files.")
-
     if st.button("Embed All Resumes"):
         embed_and_store_resumes()
 
-# --- STEP 2: Job Description Input ---
+# ---- STEP 2: JOB DESCRIPTION ----
 st.divider()
 jd_input = st.text_area(
-    "Step 2: Paste the Job Description",
-    height=220,
-    placeholder="Paste the job description here..."
+    "Step 2: Paste Job Description",
+    height=220
 )
 
-# --- STEP 3: Search ---
+# ---- STEP 3: RAG SEARCH ----
 if jd_input.strip():
     st.divider()
-    st.subheader("Step 3: Get Top Matching Resumes")
+    top_k = st.number_input("Top K Resumes", 1, 10, 3)
 
-    top_k = st.number_input(
-        "Number of top resumes to fetch",
-        min_value=1,
-        max_value=50,
-        value=5
-    )
-
-    if st.button("Find Top Matching Resumes"):
+    if st.button("Analyze Top Candidates"):
         results = search_top_k_resumes(jd_input, top_k)
 
-        if results and results.get("ids"):
-            st.markdown("### 🔍 Top Matching Resumes")
+        distances = results["distances"][0]
+        docs = results["documents"][0]
+        ids = results["ids"][0]
 
-            for i, (doc_id, distance) in enumerate(
-                zip(results["ids"][0], results["distances"][0])
-            ):
-                match_percent = (1 - distance) * 100
-
-                st.markdown(
-                    f"""
-                    **{i+1}. {doc_id}**  
-                    🔹 Match Score: **{match_percent:.2f}%**
-                    """
-                )
-                st.markdown("---")
+        if not docs or min(distances) > SIMILARITY_THRESHOLD:
+            st.warning("❌ No relevant resumes found. LLM not triggered.")
         else:
-            st.warning("No matching resumes found.")
+            prompt = build_rag_prompt(
+                jd=jd_input,
+                resume_ids=ids,
+                resume_texts=docs
+            )
+
+            answer = generate_answer(prompt)
+
+            st.subheader("✅ Top Candidates Analysis")
+            st.write(answer)
 
 else:
-    st.info("Paste a job description to search for matching resumes.")
+    st.info("Paste a job description to begin.")
 
