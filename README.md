@@ -106,5 +106,5 @@ streamlit run main.py
 ---
 ## 👤 Author
 
-* **Ritesh Bhokare**
-* **Pranav Shintre**
+* **Ritesh Bhokare (riteshbhokareedu@gmail.com)**
+* **Pranav Shintre (pranavshintre2003@gmail.com)**
